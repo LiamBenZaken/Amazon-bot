@@ -99,7 +99,7 @@ class AmazonAutoBuyer:
         # We keep the browser open in the background so the session is never lost!
         console.print("[dim]Browser will remain open in the background for fast auto-checkout.[/dim]")
 
-    def buy_product(self, url, quantity=1, max_retries=10):
+    def buy_product(self, url, target_price, quantity=1, max_retries=10):
         console.print(f"\n[bold red]🛒 INITIATING AUTO-BUY FOR {url} (Qty: {quantity})[/bold red]")
         driver = self.get_driver() # Re-uses the open browser!
         
@@ -127,6 +127,19 @@ class AmazonAutoBuyer:
                 buy_now = WebDriverWait(driver, 10, poll_frequency=0.05).until(
                     EC.presence_of_element_located((By.ID, "buy-now-button"))
                 )
+                
+                # --- NEW SAFEGUARD: DOM Double-Check ---
+                console.print("[cyan]🔍 Double-checking DOM for Phantom Restock...[/cyan]")
+                try:
+                    merchant_input = driver.find_element(By.ID, "merchantID")
+                    merchant_val = merchant_input.get_attribute("value")
+                    valid_sellers = ["ATVPDKIKX0DER", "A2XZ7JICGUQ1CX", "A11IL2PNWYJU7H"]
+                    if merchant_val not in valid_sellers:
+                        console.print(f"[bold red]🛑 PHANTOM RESTOCK ABORT: Selenium loaded a 3rd Party Seller ({merchant_val})![/bold red]")
+                        return False
+                except Exception as e:
+                    console.print(f"[bold yellow]⚠️ Could not verify Merchant DOM, clicking anyway...[/bold yellow]")
+
                 # JS click bypasses UI visibility/clickable checks
                 driver.execute_script("arguments[0].click();", buy_now)
                 
@@ -432,7 +445,7 @@ if __name__ == "__main__":
                     console.print("[bold yellow]🛠️ TEST MODE ACTIVE: Skipped actual checkout so you can test alerts![/bold yellow]")
                     success = False
                 else:
-                    success = buyer.buy_product(item["url"], quantity=qty)
+                    success = buyer.buy_product(item["url"], item["target"], quantity=qty)
                     
                 if success:
                     purchased_counts[item_id] += qty

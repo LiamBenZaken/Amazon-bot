@@ -302,16 +302,24 @@ class AmazonAutoBuyer:
                     EC.presence_of_element_located((By.ID, "buy-now-button"))
                 )
                 
-                # --- NEW SAFEGUARD: DOM Double-Check ---
+                # --- PHANTOM-RESTOCK GUARD ---
+                # FAIL-CLOSED: refuse to buy unless we can POSITIVELY confirm
+                # the seller is Amazon. If the merchantID input is missing or
+                # any error occurs, ABORT — better to miss a deal than to buy
+                # a $139 item from a third-party seller (this exact thing has
+                # happened before).
                 console.print("[cyan]🔍 Double-checking DOM for Phantom Restock...[/cyan]")
+                merchant_val = None
                 try:
                     merchant_input = driver.find_element(By.ID, "merchantID")
                     merchant_val = merchant_input.get_attribute("value")
-                    if merchant_val not in VALID_SELLERS:
-                        console.print(f"[bold red]🛑 PHANTOM RESTOCK ABORT: Selenium loaded a 3rd Party Seller ({merchant_val})![/bold red]")
-                        return False
                 except Exception as e:
-                    console.print(f"[bold yellow]⚠️ Could not verify Merchant DOM, clicking anyway...[/bold yellow]")
+                    console.print(f"[bold red]🛑 ABORT: merchantID element not found — cannot verify Amazon-as-seller. Refusing to buy. ({e})[/bold red]")
+                    return False
+                if merchant_val not in VALID_SELLERS:
+                    console.print(f"[bold red]🛑 PHANTOM RESTOCK ABORT: 3rd-party seller detected ({merchant_val!r}). Refusing to buy.[/bold red]")
+                    return False
+                console.print(f"[dim green]✓ Seller confirmed: {merchant_val} (Amazon)[/dim green]")
 
                 # JS click bypasses UI visibility/clickable checks
                 driver.execute_script("arguments[0].click();", buy_now)
@@ -500,9 +508,12 @@ class AmazonTLSTracker:
             merchant = pinned.find("input", {"id": "merchantID"})
         merchant_val = merchant.get("value") if merchant else None
 
-        if merchant_val and merchant_val not in VALID_SELLERS:
+        # Fail-closed: demand a POSITIVE Amazon match. Missing merchantID is
+        # treated as 3rd-party so the deal alert never fires on an unverified
+        # listing.
+        if merchant_val not in VALID_SELLERS:
             return {"item": item, "price": None, "time": time.time() - start,
-                    "error": "3rd Party Seller", "tier": "aod"}
+                    "error": f"3rd Party Seller ({merchant_val!r})", "tier": "aod"}
 
         price_el = pinned.find("span", {"class": "a-offscreen"})
         raw = price_el.text.strip() if price_el else ""
@@ -534,11 +545,14 @@ class AmazonTLSTracker:
                 return {"item": item, "price": None, "time": time.time() - start_time,
                         "error": "Unavailable / Cannot ship", "tier": "dp"}
 
-            # STRICT SELLER CHECK: Guarantee the seller is Amazon or Amazon Export Sales LLC
+            # STRICT SELLER CHECK (fail-closed): demand a POSITIVE Amazon match.
+            # Missing merchantID => treat as 3rd-party (refuse), since edge-case
+            # listings can omit the hidden input entirely.
             merchant_input = soup.find("input", {"id": "merchantID"})
-            if merchant_input and merchant_input.get("value") not in VALID_SELLERS:
+            merchant_val = merchant_input.get("value") if merchant_input else None
+            if merchant_val not in VALID_SELLERS:
                 return {"item": item, "price": None, "time": time.time() - start_time,
-                        "error": "3rd Party Seller", "tier": "dp"}
+                        "error": f"3rd Party Seller ({merchant_val!r})", "tier": "dp"}
 
             price_element = soup.find("span", {"class": "a-offscreen"})
             if not price_element:

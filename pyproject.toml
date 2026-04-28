@@ -1,0 +1,11 @@
+[project]
+name = "amazon-bot"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "python-dotenv>=1.2.2",
+    "rich>=15.0.0",
+    "selenium>=4.15",
+    "setuptools>=82.0.1",
+    "undetected-chromedriver>=3.5.5",
+]

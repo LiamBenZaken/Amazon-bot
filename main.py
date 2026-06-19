@@ -8,6 +8,8 @@ from curl_cffi import requests
 from bs4 import BeautifulSoup
 import time
 import re
+import random
+import threading
 import concurrent.futures
 from rich.console import Console
 from rich.table import Table
@@ -26,6 +28,173 @@ console = Console()
 
 TEST_MODE = False  # Set to False to actually buy things!
 
+# One source of truth for the Amazon-as-seller whitelist (used in both the HTTP
+# tracker and the phantom-restock guard inside buy_product).
+VALID_SELLERS = ["ATVPDKIKX0DER", "A2XZ7JICGUQ1CX", "A11IL2PNWYJU7H"]
+
+HISTORY_FILE = "history.json"
+
+# How many years of order history to scan at startup. Most users only need 1-2;
+# bump it if you have a long buying history of these specific items.
+ORDER_SCAN_YEARS = 2
+
+
+def save_counts_atomic(counts, path=HISTORY_FILE):
+    """Write to a sibling .tmp file then os.replace — survives Ctrl+C mid-write."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(counts, f, indent=4)
+    os.replace(tmp, path)
+
+
+# Terminal statuses — orders in these states are NOT counted toward the cap.
+# We only count orders that are still in flight (Ordered / Preparing /
+# Shipping / Arriving), so once a unit is delivered, refunded, cancelled, or
+# returned, the slot frees up and the bot can buy again.
+TERMINAL_ORDER_STATES = (
+    "delivered",
+    "cancelled", "canceled",
+    "refunded",
+    "returned",
+)
+
+
+def _status_text_for_card(card):
+    """Pull just the shipment-status text out of an order card so we don't
+    false-match terminal keywords against unrelated body text (e.g. 'Delivered
+    to <address>' or 'Buy it again' widgets near the bottom of the card)."""
+    candidates = card.select(
+        ".delivery-box .a-text-bold, "
+        ".a-color-success.a-text-bold, "
+        ".js-shipment-info-container .a-text-bold, "
+        "div[data-component='orderCard'] .a-text-bold, "
+        ".shipment .a-text-bold"
+    )
+    parts = [c.get_text(" ", strip=True) for c in candidates if c.get_text(strip=True)]
+    if parts:
+        return " | ".join(parts).lower()
+    # Fallback: just the first ~300 chars so terminal-keyword matching doesn't
+    # trip on stuff way down the card.
+    return card.get_text(" ")[:300].lower()
+
+
+def fetch_amazon_purchase_counts(driver, asins, lookback_years=ORDER_SCAN_YEARS, debug=True):
+    """Scan 'Your Orders' and count units that are still IN PROGRESS (not
+    delivered/cancelled/refunded/returned). Returns {asin: int} on success,
+    or None if Amazon blocked the page with re-auth/captcha (caller should
+    fall back to history.json in that case).
+
+    Tries broader filters first ('Past 3 months', 'Last 30 days') because
+    they reliably contain in-flight orders; only falls back to year filters
+    if those return nothing for our tracked ASINs."""
+    asin_set = set(asins)
+    counts = {asin: 0 for asin in asin_set}
+    current_year = time.localtime().tm_year
+
+    filters = ["months-3", "last-30"]
+    for y in range(current_year, current_year - lookback_years, -1):
+        filters.append(f"year-{y}")
+
+    debug_dir = "/tmp/amazon_bot_orders"
+    if debug:
+        try:
+            os.makedirs(debug_dir, exist_ok=True)
+        except Exception:
+            pass
+
+    for filt in filters:
+        for page in range(50):  # hard safety cap on pagination
+            url = (
+                "https://www.amazon.com/gp/your-account/order-history"
+                f"?orderFilter={filt}&startIndex={page * 10}&unifiedOrders=1"
+            )
+            try:
+                driver.get(url)
+            except Exception as e:
+                console.print(f"[dim red]Order-scan navigation error: {e}[/dim red]")
+                return None
+            time.sleep(3.5)
+
+            page_src = driver.page_source
+            page_lower = page_src.lower()
+            if (
+                "ap_signin_form" in page_src
+                or "robot check" in page_lower
+                or "/ap/signin" in driver.current_url.lower()
+            ):
+                console.print("[yellow]⚠️ Amazon asked to re-auth while scanning orders. Skipping order scan, falling back to history.json.[/yellow]")
+                return None
+
+            if debug:
+                try:
+                    with open(f"{debug_dir}/orders_{filt}_p{page}.html", "w") as f:
+                        f.write(page_src)
+                except Exception:
+                    pass
+
+            soup = BeautifulSoup(page_src, "lxml")
+            # Broader selector list — Amazon has rotated through layouts.
+            order_cards = soup.select(
+                "div.order-card, div.js-order-card, "
+                "div[data-component='orderCard'], "
+                "div.order, div[class*='order-card']"
+            )
+            if debug:
+                console.print(f"[dim]  · filter={filt} page={page}: {len(order_cards)} order card(s)[/dim]")
+            if not order_cards:
+                break
+
+            for card in order_cards:
+                # Does this card even contain a tracked ASIN? Skip cheaply if not.
+                hrefs_blob = " ".join(a.get("href", "") for a in card.select("a[href]"))
+                touched_asins = [a for a in asin_set if a in hrefs_blob]
+                if not touched_asins:
+                    continue
+
+                status = _status_text_for_card(card)
+                if any(kw in status for kw in TERMINAL_ORDER_STATES):
+                    if debug:
+                        console.print(f"[dim]    skip (terminal: {status[:80]!r}) — contained {touched_asins}[/dim]")
+                    continue
+
+                # Amazon order cards usually have BOTH the product image link
+                # AND the product title link pointing to the same /dp/ASIN —
+                # so we'd double-count without per-card ASIN dedup. Track which
+                # ASINs we've already counted in *this* card and only add once.
+                seen_asins_in_card = set()
+                for a in card.select('a[href*="/dp/"], a[href*="/gp/product/"]'):
+                    m = re.search(r'/(?:dp|gp/product)/([A-Z0-9]{10})', a.get("href", ""))
+                    if not m or m.group(1) not in asin_set:
+                        continue
+                    asin = m.group(1)
+                    if asin in seen_asins_in_card:
+                        continue
+                    seen_asins_in_card.add(asin)
+                    qty = 1
+                    item_block = a.find_parent(["div", "li"])
+                    if item_block:
+                        qmatch = re.search(
+                            r'(?:qty|quantity)[:\s]*(\d+)',
+                            item_block.get_text(" ").lower(),
+                        )
+                        if qmatch:
+                            qty = int(qmatch.group(1))
+                    counts[asin] += qty
+                    if debug:
+                        console.print(f"[dim]    + {asin} qty={qty} (status: {status[:60]!r})[/dim]")
+
+            next_btn = soup.select_one("li.a-last:not(.a-disabled) a")
+            if not next_btn:
+                break
+
+        # Once any tracked ASIN has been counted, broader filter searches stop.
+        if any(c > 0 for c in counts.values()):
+            break
+
+    if debug:
+        console.print(f"[dim]  (debug HTML dumped to {debug_dir}/ — open it if a count still looks wrong)[/dim]")
+    return counts
+
 def send_telegram_alert(message):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -36,13 +205,18 @@ def send_telegram_alert(message):
         "chat_id": chat_id,
         "text": message,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False
+        "disable_web_page_preview": False,
     }
-    try:
-        # curl_cffi requests acts exactly like standard requests here
-        requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        console.print(f"[dim red]Failed to send Telegram alert: {e}[/dim red]")
+
+    def _send():
+        try:
+            # curl_cffi requests acts exactly like standard requests here
+            requests.post(url, json=payload, timeout=5)
+        except Exception as e:
+            console.print(f"[dim red]Failed to send Telegram alert: {e}[/dim red]")
+
+    # Background daemon — never blocks the buy hot path on slow Telegram responses.
+    threading.Thread(target=_send, daemon=True).start()
 
 class AmazonAutoBuyer:
     def __init__(self):
@@ -128,17 +302,24 @@ class AmazonAutoBuyer:
                     EC.presence_of_element_located((By.ID, "buy-now-button"))
                 )
                 
-                # --- NEW SAFEGUARD: DOM Double-Check ---
+                # --- PHANTOM-RESTOCK GUARD ---
+                # FAIL-CLOSED: refuse to buy unless we can POSITIVELY confirm
+                # the seller is Amazon. If the merchantID input is missing or
+                # any error occurs, ABORT — better to miss a deal than to buy
+                # a $139 item from a third-party seller (this exact thing has
+                # happened before).
                 console.print("[cyan]🔍 Double-checking DOM for Phantom Restock...[/cyan]")
+                merchant_val = None
                 try:
                     merchant_input = driver.find_element(By.ID, "merchantID")
                     merchant_val = merchant_input.get_attribute("value")
-                    valid_sellers = ["ATVPDKIKX0DER", "A2XZ7JICGUQ1CX", "A11IL2PNWYJU7H"]
-                    if merchant_val not in valid_sellers:
-                        console.print(f"[bold red]🛑 PHANTOM RESTOCK ABORT: Selenium loaded a 3rd Party Seller ({merchant_val})![/bold red]")
-                        return False
                 except Exception as e:
-                    console.print(f"[bold yellow]⚠️ Could not verify Merchant DOM, clicking anyway...[/bold yellow]")
+                    console.print(f"[bold red]🛑 ABORT: merchantID element not found — cannot verify Amazon-as-seller. Refusing to buy. ({e})[/bold red]")
+                    return False
+                if merchant_val not in VALID_SELLERS:
+                    console.print(f"[bold red]🛑 PHANTOM RESTOCK ABORT: 3rd-party seller detected ({merchant_val!r}). Refusing to buy.[/bold red]")
+                    return False
+                console.print(f"[dim green]✓ Seller confirmed: {merchant_val} (Amazon)[/dim green]")
 
                 # JS click bypasses UI visibility/clickable checks
                 driver.execute_script("arguments[0].click();", buy_now)
@@ -247,6 +428,21 @@ class AmazonTLSTracker:
                 self.session.cookies.set(cookie['name'], cookie['value'], domain=cookie.get('domain', ''))
 
         self.exchange_rate = self.get_live_exchange_rate()
+        self._start_rate_refresher()
+
+    def _start_rate_refresher(self):
+        """Refresh USD↔ILS rate every 30 min in a daemon thread so long runs
+        don't compare against a stale rate from startup."""
+        def loop():
+            while True:
+                time.sleep(1800)
+                try:
+                    new_rate = self.get_live_exchange_rate()
+                    if new_rate:
+                        self.exchange_rate = new_rate
+                except Exception as e:
+                    console.print(f"[dim red]Rate refresh failed: {e}[/dim red]")
+        threading.Thread(target=loop, daemon=True).start()
 
     def get_live_exchange_rate(self):
         try:
@@ -260,14 +456,85 @@ class AmazonTLSTracker:
             console.print(f"[bold red]⚠️ Failed to fetch live rate, falling back to 3.65. Error: {e}[/bold red]")
             return 3.65
 
-    def check_price(self, item):
+    def _parse_price_text(self, raw):
+        """Strip currency, convert ILS→USD if needed. Returns (usd_price, raw)
+        or (None, raw) if unparseable."""
+        if not raw:
+            return None, raw
+        clean = re.sub(r'[^\d.]', '', raw)
+        if not clean:
+            return None, raw
+        try:
+            n = float(clean)
+        except ValueError:
+            return None, raw
+        if "ILS" in raw or "₪" in raw:
+            n = n / self.exchange_rate
+        return n, raw
+
+    def _check_aod(self, item):
+        """Tier-1 cheap probe: hits /gp/aod/ajax/?asin=ASIN — Amazon's offer-listing
+        fragment. ~5x smaller payload than /dp/, ~2x more permissive rate-limit
+        budget (community-observed). Returns same shape as _check_dp on success,
+        or None to signal 'AOD didn't give us a usable answer, escalate to /dp/'."""
+        asin = item["id"]
+        aod_url = f"https://www.amazon.com/gp/aod/ajax/?asin={asin}&pc=dp"
+        start = time.time()
+        try:
+            r = self.session.get(
+                aod_url,
+                timeout=10,
+                headers={"Referer": item["url"]},
+            )
+        except Exception as e:
+            return None  # network error → caller falls back to /dp/
+
+        if r.status_code != 200 or not r.content:
+            return None
+
+        soup = BeautifulSoup(r.content, "lxml")
+
+        # The pinned (top) offer is the buy-box winner. If absent, try the first
+        # entry in the offer list.
+        pinned = (
+            soup.find("div", {"id": "aod-pinned-offer"})
+            or soup.select_one("div[id^='aod-offer'], div.aod-offer")
+        )
+        if not pinned:
+            return None  # unfamiliar layout → escalate
+
+        merchant = pinned.find("input", {"id": "aod-offer-soldBy-merchantID"})
+        if not merchant:
+            merchant = pinned.find("input", {"id": "merchantID"})
+        merchant_val = merchant.get("value") if merchant else None
+
+        # Fail-closed: demand a POSITIVE Amazon match. Missing merchantID is
+        # treated as 3rd-party so the deal alert never fires on an unverified
+        # listing.
+        if merchant_val not in VALID_SELLERS:
+            return {"item": item, "price": None, "time": time.time() - start,
+                    "error": f"3rd Party Seller ({merchant_val!r})", "tier": "aod"}
+
+        price_el = pinned.find("span", {"class": "a-offscreen"})
+        raw = price_el.text.strip() if price_el else ""
+        usd, raw = self._parse_price_text(raw)
+        if usd is None:
+            return None  # couldn't read price → escalate
+
+        return {"item": item, "price": usd, "time": time.time() - start,
+                "error": None, "raw": raw, "tier": "aod"}
+
+    def _check_dp(self, item):
+        """Tier-2: full /dp/ page. Authoritative — same parse the buy hot path
+        uses. Heavier (~300KB vs ~30-60KB for AOD) but matches Selenium's view."""
         url = item["url"]
         try:
             start_time = time.time()
             response = self.session.get(url, timeout=10)
 
             if response.status_code != 200:
-                return {"item": item, "price": None, "time": time.time() - start_time, "error": f"Status: {response.status_code}"}
+                return {"item": item, "price": None, "time": time.time() - start_time,
+                        "error": f"Status: {response.status_code}", "tier": "dp"}
 
             soup = BeautifulSoup(response.content, "lxml")
 
@@ -275,67 +542,128 @@ class AmazonTLSTracker:
             buy_now = soup.find("input", {"id": "buy-now-button"})
 
             if not add_to_cart and not buy_now:
-                return {"item": item, "price": None, "time": time.time() - start_time, "error": "Unavailable / Cannot ship"}
+                return {"item": item, "price": None, "time": time.time() - start_time,
+                        "error": "Unavailable / Cannot ship", "tier": "dp"}
 
-            # STRICT SELLER CHECK: Guarantee the seller is Amazon or Amazon Export Sales LLC
+            # STRICT SELLER CHECK (fail-closed): demand a POSITIVE Amazon match.
+            # Missing merchantID => treat as 3rd-party (refuse), since edge-case
+            # listings can omit the hidden input entirely.
             merchant_input = soup.find("input", {"id": "merchantID"})
-            valid_amazon_sellers = ["ATVPDKIKX0DER", "A2XZ7JICGUQ1CX", "A11IL2PNWYJU7H"]
-            if merchant_input and merchant_input.get("value") not in valid_amazon_sellers:
-                return {"item": item, "price": None, "time": time.time() - start_time, "error": "3rd Party Seller"}
+            merchant_val = merchant_input.get("value") if merchant_input else None
+            if merchant_val not in VALID_SELLERS:
+                return {"item": item, "price": None, "time": time.time() - start_time,
+                        "error": f"3rd Party Seller ({merchant_val!r})", "tier": "dp"}
 
             price_element = soup.find("span", {"class": "a-offscreen"})
+            if not price_element:
+                return {"item": item, "price": None, "time": time.time() - start_time,
+                        "error": "Could not find price tag", "tier": "dp"}
 
-            if price_element:
-                raw_price_text = price_element.text.strip()
-                clean_number_str = re.sub(r'[^\d.]', '', raw_price_text)
+            raw = price_element.text.strip()
+            usd, raw = self._parse_price_text(raw)
+            if usd is None:
+                return {"item": item, "price": None, "time": time.time() - start_time,
+                        "error": "Could not parse price", "tier": "dp"}
 
-                if not clean_number_str:
-                    return {"item": item, "price": None, "time": time.time() - start_time, "error": "Could not parse price"}
-
-                numeric_price = float(clean_number_str)
-                final_usd_price = numeric_price
-
-                if "ILS" in raw_price_text or "₪" in raw_price_text:
-                    final_usd_price = numeric_price / self.exchange_rate
-
-                return {"item": item, "price": final_usd_price, "time": time.time() - start_time, "error": None, "raw": raw_price_text}
-            else:
-                return {"item": item, "price": None, "time": time.time() - start_time, "error": "Could not find price tag"}
+            return {"item": item, "price": usd, "time": time.time() - start_time,
+                    "error": None, "raw": raw, "tier": "dp"}
 
         except Exception as e:
-            return {"item": item, "price": None, "time": 0, "error": f"Network Error: {e}"}
+            return {"item": item, "price": None, "time": 0,
+                    "error": f"Network Error: {e}", "tier": "dp"}
+
+    def check_price(self, item):
+        """Two-tier check: cheap AOD probe first, then escalate to the full
+        /dp/ page only when AOD signals a possible deal (or AOD couldn't give
+        us a clear answer). The /dp/ confirmation matches what Selenium will
+        see at buy time, preserving the phantom-restock guarantee."""
+        target = item["target"]
+        aod = self._check_aod(item)
+
+        if aod is None:
+            # AOD failed / unfamiliar layout — fall back to /dp/.
+            return self._check_dp(item)
+
+        if aod.get("error"):
+            # AOD said 3rd-party / errored. Trust it (cheaper).
+            return aod
+
+        if aod.get("price") is not None and aod["price"] > target * 1.10:
+            # Comfortably above target — AOD answer is good enough, save the /dp/ hit.
+            return aod
+
+        # AOD shows price near or below target — escalate for the authoritative read.
+        dp = self._check_dp(item)
+        # If /dp/ disagrees (still 3rd-party, OOS, etc.), return /dp/ as authoritative.
+        return dp
 
 
-if __name__ == "__main__":
+def main():
     console.print("\n[bold cyan]🔧 Setting up Amazon AutoBuyer...[/bold cyan]")
     buyer = AmazonAutoBuyer()
     buyer.setup_login()
-    
+
     console.print("\n[dim]Extracting session cookies from AutoBuyer...[/dim]")
     session_cookies = buyer.get_driver().get_cookies()
 
     tracker = AmazonTLSTracker(cookies=session_cookies)
 
-    HISTORY_FILE = "history.json"
-    purchased_counts = {}
-    
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r") as f:
-                purchased_counts = json.load(f)
-            console.print(f"[green]📂 Loaded purchase history from {HISTORY_FILE}[/green]")
-        except Exception as e:
-            console.print(f"[bold red]⚠️ Failed to load history.json: {e}[/bold red]")
-            
-    # Ensure all products have a key in case new ones were added
-    for item_id in PRODUCTS.keys():
-        if item_id not in purchased_counts:
-            purchased_counts[item_id] = 0
+    purchased_counts = {item_id: 0 for item_id in PRODUCTS.keys()}
+
+    # The cap is per-account, in-flight: a unit only counts while it's still
+    # being delivered. Once delivered (or cancelled/refunded/returned), the
+    # slot frees up and the bot may buy again. Source-of-truth = Amazon
+    # 'Your Orders' page. history.json is only a fallback for when the
+    # orders scan is blocked (re-auth/captcha) or for crash recovery during
+    # a run before Amazon's orders page has propagated a brand-new buy.
+    console.print(f"\n[cyan]🔎 Scanning your Amazon in-progress orders (last {ORDER_SCAN_YEARS} year(s))...[/cyan]")
+    amazon_counts = fetch_amazon_purchase_counts(
+        buyer.get_driver(), list(PRODUCTS.keys()), lookback_years=ORDER_SCAN_YEARS,
+    )
+
+    if amazon_counts is not None:
+        # Scan succeeded — Amazon is authoritative. Wipe stale history.json
+        # state so delivered orders correctly free up slots.
+        for asin in PRODUCTS:
+            purchased_counts[asin] = amazon_counts.get(asin, 0)
+        for asin, c in amazon_counts.items():
+            label = "in-progress" if c > 0 else "none in flight"
+            console.print(f"[green]  ↳ {PRODUCTS[asin]['name']}: {c} {label}[/green]")
+        save_counts_atomic(purchased_counts, HISTORY_FILE)
+    else:
+        # Fall back to history.json (best-effort) when scan was blocked.
+        if os.path.exists(HISTORY_FILE):
+            try:
+                with open(HISTORY_FILE, "r") as f:
+                    history_counts = json.load(f)
+                for k, v in history_counts.items():
+                    if k in purchased_counts:
+                        purchased_counts[k] = int(v)
+                console.print(f"[green]📂 Fallback: loaded counts from {HISTORY_FILE}[/green]")
+            except Exception as e:
+                console.print(f"[bold red]⚠️ Failed to load history.json: {e}[/bold red]")
+
+    # Print starting state so the user sees exactly where they're at.
+    start_table = Table(title="📊 Starting state (lifetime per account)", header_style="bold magenta")
+    start_table.add_column("Product", style="cyan")
+    start_table.add_column("Already bought", justify="right")
+    start_table.add_column("Max", justify="right")
+    start_table.add_column("Remaining", justify="right", style="green")
+    for asin, p in PRODUCTS.items():
+        c = purchased_counts.get(asin, 0)
+        rem = max(0, p["max_limit"] - c)
+        start_table.add_row(p["name"], str(c), str(p["max_limit"]), str(rem))
+    console.print(start_table)
 
     loop_count = 1
-    
-    # State tracker to prevent Telegram spam
+
+    # State tracker to prevent Telegram spam.
     active_deals = {item_id: False for item_id in PRODUCTS.keys()}
+    # Per-item flag: did the LAST buy attempt within the current below-target
+    # window fail? If yes, don't re-attempt on every subsequent loop while the
+    # price stays below target — that would burst-poll Amazon. Reset when the
+    # price recovers above target.
+    last_buy_failed = {item_id: False for item_id in PRODUCTS.keys()}
     
     while True:
         console.print(f"\n[bold cyan]🚀 Firing TLS HTTP Requests Concurrently (Check #{loop_count})...[/bold cyan]\n")
@@ -354,6 +682,7 @@ if __name__ == "__main__":
         table.add_column("Target Price", justify="right", style="blue")
         table.add_column("Current Price", justify="right")
         table.add_column("Status", justify="center")
+        table.add_column("Tier", justify="center", style="dim")  # aod vs dp
         table.add_column("Time", justify="right", style="dim")
 
         for res in results:
@@ -384,7 +713,8 @@ if __name__ == "__main__":
                 status = "[red]❌ N/A[/red]"
                 
             time_taken = f"{res['time']:.2f}s"
-            table.add_row(name, target, current_price, status, time_taken)
+            tier = res.get("tier", "?")
+            table.add_row(name, target, current_price, status, tier, time_taken)
 
         console.print(table)
         console.print(f"\n[bold cyan]⏱️ Total execution time: {end_all - start_all:.2f}s[/bold cyan]\n")
@@ -400,73 +730,129 @@ if __name__ == "__main__":
                 
                 # Check if it hit the target
                 if price < item["target"]:
-                    
+
                     # Prevent Telegram spam: Only alert if it wasn't already an active deal
                     if not active_deals[item_id]:
                         active_deals[item_id] = True
                         alert_msg = f"🚨 <b>DEAL ALERT!</b>\n\n<b>{item['name']}</b> is below target!\nCurrent Price: ${price:.2f}\n\n🛒 <a href='{item['url']}'>Click here to buy manually!</a>"
                         send_telegram_alert(alert_msg)
-                        
-                    # Only buy if we haven't maxed out yet
-                    if purchased_counts[item_id] < item["max_limit"]:
+
+                    # Only enqueue a buy if (a) we haven't maxed out, AND
+                    # (b) the LAST attempt in this same below-target window
+                    # didn't already fail (otherwise we'd burst-retry on every
+                    # loop — which is what hammered the bot in TEST_MODE).
+                    if (
+                        purchased_counts[item_id] < item["max_limit"]
+                        and not last_buy_failed[item_id]
+                    ):
                         # Determine quantity from rules
                         qty_to_buy = 1
                         for max_price, rule_qty in item["quantity_rules"]:
                             if price <= max_price:
                                 qty_to_buy = rule_qty
                                 break # Found the tier!
-                                
+
                         # Enforce the max limit!
                         remaining_allowed = item["max_limit"] - purchased_counts[item_id]
                         if qty_to_buy > remaining_allowed:
                             qty_to_buy = remaining_allowed
-                            
+
                         if qty_to_buy > 0:
                             res["buy_qty"] = qty_to_buy
                             buy_alerts.append(res)
                 else:
                     # Price is above target. Reset deal state so we can alert again if it drops.
                     active_deals[item_id] = False
+                    last_buy_failed[item_id] = False
             else:
                 # Item is out of stock / unavailable. Reset deal state.
                 active_deals[item_id] = False
+                last_buy_failed[item_id] = False
         
+        any_buy_succeeded = False
         if buy_alerts:
             for res in buy_alerts:
                 item = res["item"]
                 item_id = item["id"]
                 qty = res["buy_qty"]
-                
+
                 console_alert = f"[bold green]🚨 DEAL ALERT! [{item['name']}] is below ${item['target']:.2f}! (Current: ${res['price']:.2f})[/bold green]\nBuying Quantity: {qty} | {item['url']}"
                 console.print(Panel(console_alert, title="🎯 Target Reached", border_style="green"))
-                
+
                 # TRIGGER AUTO BUYER
                 if TEST_MODE:
                     console.print("[bold yellow]🛠️ TEST MODE ACTIVE: Skipped actual checkout so you can test alerts![/bold yellow]")
                     success = False
                 else:
                     success = buyer.buy_product(item["url"], item["target"], quantity=qty)
-                    
+
                 if success:
+                    any_buy_succeeded = True
                     purchased_counts[item_id] += qty
-                    # Save the new counts to local db
+                    last_buy_failed[item_id] = False
+                    # Atomic write — survives Ctrl+C / crash mid-write without corrupting the file.
                     try:
-                        with open(HISTORY_FILE, "w") as f:
-                            json.dump(purchased_counts, f, indent=4)
+                        save_counts_atomic(purchased_counts, HISTORY_FILE)
                         console.print(f"[dim]💾 Saved updated purchase state to {HISTORY_FILE}[/dim]")
                     except Exception as e:
                         console.print(f"[bold red]⚠️ Failed to save state to {HISTORY_FILE}: {e}[/bold red]")
                 else:
-                    console.print(f"[bold red]⚠️ Skipped adding to purchase count because auto-buy failed.[/bold red]")
-                
-            console.print("\n[bold magenta]🎉 Deals processed. Checking prices IMMEDIATELY to fill remaining limits![/bold magenta]")
-        else:
+                    last_buy_failed[item_id] = True
+                    console.print(f"[bold red]⚠️ Buy failed — won't retry until price recovers above target (prevents burst-polling).[/bold red]")
+
+            if any_buy_succeeded:
+                # At least one buy went through — check immediately so we can
+                # grab more units before stock vanishes (multi-buy fast path).
+                console.print("\n[bold magenta]🎉 Buy succeeded. Checking prices IMMEDIATELY to fill remaining limits![/bold magenta]")
+            else:
+                # No buys succeeded — fall through to the adaptive sleep below
+                # so we don't hammer Amazon while everything's still failing.
+                console.print("\n[dim]All buy attempts skipped/failed — waiting before next check.[/dim]")
+        if not buy_alerts or not any_buy_succeeded:
             if all(count >= PRODUCTS[item_id]["max_limit"] for item_id, count in purchased_counts.items()):
                 console.print(Panel("All products have reached their max purchase limit of 5!", title="✅ Finished", border_style="magenta"))
                 break # We can safely stop if EVERYTHING is bought.
             else:
                 console.print(Panel("No new products are below their target prices right now.", title="💤 Nothing to buy", border_style="yellow"))
-                console.print("\n[dim]Waiting 15 seconds before checking again...[/dim]")
-                time.sleep(15)
-            
+
+                # Adaptive interval: closer to target = poll faster.
+                # ±20% jitter so we don't hit Amazon at perfectly mechanical intervals.
+                ratios = [
+                    res["price"] / res["item"]["target"]
+                    for res in results
+                    if res.get("price") is not None
+                    and purchased_counts[res["item"]["id"]] < res["item"]["max_limit"]
+                ]
+                # Hard cap: never wait more than 10s between checks. AOD-only
+                # polling at this rate is ~0.2 req/s for 2 ASINs — well under
+                # any rate-limit threshold — and it keeps worst-case detection
+                # lag bounded for flash drops.
+                if not ratios:
+                    # No readable prices (all 3rd-party / OOS / errors).
+                    base = 10.0
+                    ratio_str = "no readable prices"
+                else:
+                    ratio = min(ratios)
+                    if ratio <= 1.05:
+                        base = 1.0    # within 5% — moments away, poll fast
+                    elif ratio <= 1.10:
+                        base = 2.0
+                    elif ratio <= 1.20:
+                        base = 4.0
+                    elif ratio <= 1.50:
+                        base = 8.0
+                    else:
+                        base = 10.0   # capped — never blind for more than ~10s
+                    ratio_str = f"closest price/target ratio: {ratio:.2f}"
+                wait = base * random.uniform(0.8, 1.2)
+                console.print(f"\n[dim]Waiting {wait:.1f}s ({ratio_str})...[/dim]")
+                time.sleep(wait)
+
         loop_count += 1
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n[bold yellow]🛑 Ctrl+C received — shutting down cleanly.[/bold yellow]")

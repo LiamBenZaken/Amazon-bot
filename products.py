@@ -9,8 +9,8 @@ PRODUCTS = {
     },
     "B0G4XJPN8Q": {
         "id": "B0G4XJPN8Q",
-        "name": "Ascended Premium Collection", 
-        "url": "https://www.amazon.com/dp/B0G4XJPN8Q/?smid=ATVPDKIKX0DER", 
+        "name": "Ascended Premium Collection",
+        "url": "https://www.amazon.com/dp/B0G4XJPN8Q/?smid=ATVPDKIKX0DER",
         "target": 125.00,
         "max_limit": 5,
         "quantity_rules": [(125.00, 1)]
